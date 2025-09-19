@@ -4,55 +4,74 @@ from torch.utils.data import TensorDataset, DataLoader
 from pandas import read_csv, DataFrame, concat
 from sklearn.preprocessing import MinMaxScaler
 
-def load_data(data_path, n_train_hours, batch_size_train=8192*4, batch_size_test=64):
+def load_data(data_path, n_train_hours, batch_size_train=2, batch_size_test=64):
     dataset = read_csv(data_path, header=0, index_col=0)
-    def parse_complex_series(series):
-        return np.array([np.fromstring(s[1:-1], sep=' ', dtype=complex) for s in series])
     
-    demand_mainbus_real = np.stack([parse_complex_series(dataset['demand_mainbus']).real[:, i] for i in range(3)], axis=1)
-    demand_mainbus_imag = np.stack([parse_complex_series(dataset['demand_mainbus']).imag[:, i] for i in range(3)], axis=1)
-    demand_schlinger_real = np.stack([parse_complex_series(dataset['demand_schlinger']).real[:, i] for i in range(3)], axis=1)
-    demand_schlinger_imag = np.stack([parse_complex_series(dataset['demand_schlinger']).imag[:, i] for i in range(3)], axis=1)
-    demand_resnick_real = np.stack([parse_complex_series(dataset['demand_resnick']).real[:, i] for i in range(3)], axis=1)
-    demand_resnick_imag = np.stack([parse_complex_series(dataset['demand_resnick']).imag[:, i] for i in range(3)], axis=1)
-    demand_beckman_real = np.stack([parse_complex_series(dataset['demand_beckman']).real[:, i] for i in range(3)], axis=1)
-    demand_beckman_imag = np.stack([parse_complex_series(dataset['demand_beckman']).imag[:, i] for i in range(3)], axis=1)
-    demand_braun_real = np.stack([parse_complex_series(dataset['demand_braun']).real[:, i] for i in range(3)], axis=1)
-    demand_braun_imag = np.stack([parse_complex_series(dataset['demand_braun']).imag[:, i] for i in range(3)], axis=1)
+    def parse_complex_series(series):
+        # Parse the string format: "[real1;imag1;real2;imag2;real3;imag3]"
+        parsed_list = []
+        for i, s in enumerate(series):
+            # Remove brackets and split by comma
+            values = s[1:-1].split(';')
+            # Convert to float
+            float_values = [float(v) for v in values]
+            parsed_list.append(float_values)
+        
+        # Convert to numpy array
+        parsed = np.array(parsed_list)
+        complex_parsed = parsed[:, 0::2] + 1j * parsed[:, 1::2]
+        
+        return complex_parsed
+    
+    # Parse all demand variables
+    demand_vars = ['demand_mainbus', 'demand_broad', 'demand_schlinger', 'demand_resnick', 'demand_beckman', 'demand_braun']
+    demand_data = {}
+    
+    # Parse other variables
+    for var in demand_vars:
+        parsed = parse_complex_series(dataset[var])
+        demand_data[f"{var}_real"] = parsed.real
+        demand_data[f"{var}_imag"] = parsed.imag
 
+    # Check weather features
+    weather_cols = ['temp', 'feelslike', 'humidity', 'windspeed', 'solarradiation']
+    available_weather = [col for col in weather_cols if col in dataset.columns]
+    
     input_features = np.hstack([
-        demand_mainbus_real,  
-        demand_mainbus_imag,  
-        demand_schlinger_real,
-        demand_schlinger_imag,
-        demand_resnick_real,
-        demand_resnick_imag,
-        demand_beckman_real,
-        demand_beckman_imag,
-        demand_braun_real,
-        demand_braun_imag,
-        dataset[['temp', 'humidity', 'windspeed', 'solarradiation']].values 
-    ]) # 3*10+4
+        demand_data['demand_mainbus_real'],  
+        demand_data['demand_mainbus_imag'],
+        demand_data['demand_broad_real'],
+        demand_data['demand_broad_imag'],
+        demand_data['demand_schlinger_real'],
+        demand_data['demand_schlinger_imag'],
+        demand_data['demand_resnick_real'],
+        demand_data['demand_resnick_imag'],
+        demand_data['demand_beckman_real'],
+        demand_data['demand_beckman_imag'],
+        demand_data['demand_braun_real'],
+        demand_data['demand_braun_imag'],
+        dataset[available_weather].values 
+    ]) # 3*12+5 = 41 features
     scaler = MinMaxScaler(feature_range=(0, 1))
     scaled_input = scaler.fit_transform(input_features)
+    all_col, weather_col = scaled_input.shape[1], 5
     
     n_in = 1
     n_out = 1
 
     columns_to_drop = []
     for i in range(n_out):
-        start_col = (n_in + i) * 34 + 30
-        end_col = (n_in + i) * 34 + 33
+        start_col = (n_in + i) * all_col + (all_col-5)
+        end_col = (n_in + i) * all_col + (all_col-1)
         columns_to_drop.extend(range(start_col, end_col + 1))
 
     reframed = series_to_supervised(scaled_input, n_in=n_in, n_out=n_out)
     reframed.drop(reframed.columns[columns_to_drop], axis=1, inplace=True)
     
-    output_dim = 30*n_out
     train = reframed.values[:n_train_hours, :]
     test = reframed.values[n_train_hours:, :]
-    train_X, train_y = train[:, output_dim:], train[:, :output_dim]
-    test_X, test_y = test[:, output_dim:], test[:, :output_dim]
+    train_X, train_y = train[:, :all_col], train[:, all_col:]
+    test_X, test_y = test[:, :all_col], test[:, all_col:]
     
     train_X = torch.tensor(train_X).float().unsqueeze(1)
     train_y = torch.tensor(train_y).float()

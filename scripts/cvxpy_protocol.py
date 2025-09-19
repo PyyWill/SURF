@@ -1,365 +1,528 @@
+"""
+Optimal Power Flow (OPF) Problem Solver with Decision-Aware Uncertainty Quantification.
+
+This module provides classes for solving optimal power flow problems in electrical grids
+using CVXPY optimization and PyTorch integration for neural network training.
+"""
+
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 import numpy as np
 import torch
 import yaml
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Union
+from enum import Enum
 
-class opf_problem:
+# Constants
+BIG_M = 10000
+PHASE_COUNT = 3
+NODE_INDICES = {
+    'MAINBUS': 0,
+    'BROAD': 1,
+    'SCHLINGER': 2, 
+    'RESNICK': 3,
+    'BECKMAN': 4,
+    'BRAUN': 5
+}
+
+
+class NodeType(Enum):
+    """Node types in the power grid."""
+    BATTERY = 0
+    IMPEDANCE = 1
+    PV = 2
+
+
+@dataclass
+class GridParameters:
+    """Data class for grid parameters."""
+    T: int
+    N: int
+    Y_A: Dict[str, np.ndarray]
+    adj_matrix: np.ndarray
+    node_class: Dict[int, List[int]]
+    RTP: np.ndarray
+
+
+@dataclass
+class PowerDemands:
+    """Data class for power demand parameters."""
+    real_mainbus: torch.Tensor
+    real_broad: torch.Tensor
+    real_schlinger: torch.Tensor
+    real_resnick: torch.Tensor
+    real_beckman: torch.Tensor
+    real_braun: torch.Tensor
+
+
+class OptimalPowerFlowProblem:
+    """
+    Optimal Power Flow problem solver for electrical grids.
+    
+    This class formulates and solves the OPF problem using CVXPY optimization,
+    including linear distribution flow constraints, operational constraints,
+    and nodal injection equations.
+    """
+    
     def __init__(self, 
-                T: int, 
-                N: int, 
-                Y_A: np.ndarray, 
-                adj_matrix: np.ndarray, 
-                node_class: dict, 
-                RTP: np.ndarray, 
-                real_mainbus: torch.Tensor,
-                real_schlinger: torch.Tensor,
-                real_resnick: torch.Tensor,
-                real_beckman: torch.Tensor,
-                real_braun: torch.Tensor,
-                imag_mainbus: torch.Tensor,
-                imag_schlinger: torch.Tensor,
-                imag_resnick: torch.Tensor,
-                imag_beckman: torch.Tensor,
-                imag_braun: torch.Tensor
+                 T: int, 
+                 N: int, 
+                 Y_A: np.ndarray, 
+                 adj_matrix: np.ndarray, 
+                 node_class: dict, 
+                 RTP: np.ndarray, 
+                 real_mainbus: torch.Tensor,
+                 real_broad: torch.Tensor,
+                 real_schlinger: torch.Tensor,
+                 real_resnick: torch.Tensor,
+                 real_beckman: torch.Tensor,
+                 real_braun: torch.Tensor
                  ):
         """
         Initialize an optimal power flow problem instance.
 
-        Parameters:
-        - T (int): The number of time periods.
-        - N (int): The number of buses.
-        - Z_common (np.ndarray): The common impedance matrix. (change)
-        - adj_matrix (np.ndarray): The matrix representing the grid topology
-        - node_class (dict): A dictionary categorizing each node into different functionalities. (battery, impedance, PV)
-        - RTP (np.ndarray): Real-Time Pricing rates for each time period, an array of length T.
-        - demand (np.ndarray): The electrical demand for each node across the time periods.
-
-        Returns:
-        None. This is a constructor method for initializing the class instance with the given parameters.
+        Args:
+            T: The number of time periods.
+            N: The number of buses.
+            Y_A: The admittance matrix dictionary.
+            adj_matrix: The matrix representing the grid topology.
+            node_class: A dictionary categorizing each node into different functionalities.
+            RTP: Real-Time Pricing rates for each time period.
+            real_mainbus: Main bus real power demand.
+            real_broad: Broad node real power demand.
+            real_schlinger: Schlinger node real power demand.
+            real_resnick: Resnick node real power demand.
+            real_beckman: Beckman node real power demand.
+            real_braun: Braun node real power demand.
         """
+        self._setup_parameters(T, N, Y_A, adj_matrix, node_class, RTP, real_mainbus, real_broad, real_schlinger, real_resnick, real_beckman, real_braun)
+        self._setup_electrical_parameters()
+        self._setup_optimization_variables()
+        
+    def _setup_parameters(self, T: int, N: int, Y_A: np.ndarray, 
+                         adj_matrix: np.ndarray, node_class: dict, RTP: np.ndarray, real_mainbus: torch.Tensor, real_broad: torch.Tensor, real_schlinger: torch.Tensor, real_resnick: torch.Tensor, real_beckman: torch.Tensor, real_braun: torch.Tensor) -> None:
+        """Setup basic problem parameters."""
         self.T = T
         self.N = N
         self.Y_A = Y_A
         self.adj_matrix = adj_matrix
         self.RTP = RTP
-        ###
-        self.real_mainbus = cp.Parameter([3,1])
-        self.imag_mainbus = cp.Parameter([3,1])
-        self.real_schlinger = cp.Parameter([3,1])
-        self.imag_schlinger = cp.Parameter([3,1])
-        self.real_resnick = cp.Parameter([3,1])
-        self.imag_resnick = cp.Parameter([3,1])
-        self.real_beckman = cp.Parameter([3,1])
-        self.imag_beckman = cp.Parameter([3,1])
-        self.real_braun = cp.Parameter([3,1])
-        self.imag_braun = cp.Parameter([3,1])
-        ###
-        self.battery_node_ls = node_class[0]
-        self.impedance_node_ls = node_class[1]
-        self.PV_node_ls = node_class[2]
 
+        self.real_mainbus = cp.Parameter([T,3])
+        self.real_broad = cp.Parameter([T,3])
+        self.real_schlinger = cp.Parameter([T,3])
+        self.real_resnick = cp.Parameter([T,3])
+        self.real_beckman = cp.Parameter([T,3])
+        self.real_braun = cp.Parameter([T,3])
+        
+        # Node classifications
+        self.battery_nodes = node_class[NodeType.BATTERY.value]
+        self.impedance_nodes = node_class[NodeType.IMPEDANCE.value]
+        
+    def _setup_electrical_parameters(self) -> None:
+        """Setup electrical system parameters."""
+        # Three-phase transformation matrix
         self.gamma = np.array([
             [1, -0.5 + 0.5 * np.sqrt(3) * 1j, -0.5 - 0.5 * np.sqrt(3) * 1j],
             [-0.5 - 0.5 * np.sqrt(3) * 1j, 1, -0.5 + 0.5 * np.sqrt(3) * 1j],
             [-0.5 + 0.5 * np.sqrt(3) * 1j, -0.5 - 0.5 * np.sqrt(3) * 1j, 1],
         ])
-        self.B = np.outer(self.gamma[:,0], self.gamma[:,0].conj())
-        self.Y = {}
+        
+        # Voltage transformation matrix
+        self.B = np.outer(self.gamma[:, 0], self.gamma[:, 0].conj())
+        
+        # Impedance matrix
+        self.Y = self._create_impedance_matrix()
+        
+        # Optimization constraints
         self.constraints = []
-        self._create_impedance_matrix()
-        self.grid_variable = self.create_grid_variable()
-        self.device_variable = self.create_device_variable()
-
-    def _create_impedance_matrix(self):
+        
+    def _create_impedance_matrix(self) -> Dict[str, np.ndarray]:
+        """Create impedance matrix from adjacency matrix."""
+        Y = {}
         connections = np.where(self.adj_matrix == 1)
         for i, j in zip(*connections):
-            self.Y[f"{i}{j}"] = self.Y_A[f"{i}_{j}"]
-
-    def dfs(self, start, visited=None):
+            Y[f"{i}{j}"] = self.Y_A[f"{i}_{j}"]
+        return Y
+        
+    def _setup_optimization_variables(self) -> None:
+        """Setup CVXPY optimization variables."""
+        self.grid_variables = self._create_grid_variables()
+        self.device_variables = self._create_device_variables()
+        
+    def _create_grid_variables(self) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
+        """Create grid-related optimization variables."""
+        S = {}  # Power flow variables
+        s = {}  # Node power injection
+        v = {}  # Voltage matrix
+        lam = {}  # Lagrange multipliers
+        va = {}  # Voltage amplitude
+        
+        connections = np.where(self.adj_matrix == 1)
+        
+        for t in range(self.T):
+            # Node variables
+            for n in range(self.N):
+                s[f"{n}_{t}"] = cp.Variable((PHASE_COUNT, 1), complex=True)
+                v[f"{n}_{t}"] = cp.Variable((PHASE_COUNT, PHASE_COUNT), complex=True)
+                va[f"{n}_{t}"] = cp.Variable(complex=False)
+                
+                # Voltage constraints
+                self.constraints += [v[f"{n}_{t}"] - va[f"{n}_{t}"] * self.B == 0]
+                # self.constraints += [v[f"{n}_{t}"] >> 0]
+                
+            # Connection variables
+            for j, k in zip(*connections):
+                S[f"{j}{k}_{t}"] = cp.Variable((PHASE_COUNT, PHASE_COUNT), complex=True)
+                lam[f"{j}{k}_{t}"] = cp.Variable((PHASE_COUNT, 1), complex=True)
+                
+        return (S, s, v, lam, va)
+        
+    def _create_device_variables(self) -> Tuple[Dict, Dict]:
+        """Create device-related optimization variables."""
+        p_battery = {}
+        p_impedance = {}
+        
+        for t in range(self.T):
+            for n in self.battery_nodes:
+                p_battery[f"{n}_{t}"] = cp.Variable((PHASE_COUNT, 1))
+            for n in self.impedance_nodes:
+                p_impedance[f"{n}_{t}"] = cp.Variable((PHASE_COUNT, 1))
+                
+        return (p_battery, p_impedance)
+        
+    def _dfs(self, start: int, visited: Optional[set] = None) -> set:
+        """Depth-first search for tree structure analysis."""
         mat = np.triu(self.adj_matrix)
         if visited is None:
             visited = set()
         visited.add(start)
-        for neighbor, isConnected in enumerate(mat[start]):
-            if isConnected and neighbor not in visited:
-                self.dfs(neighbor, visited)
+        
+        for neighbor, is_connected in enumerate(mat[start]):
+            if is_connected and neighbor not in visited:
+                self._dfs(neighbor, visited)
         return visited
-
-    def find_path(self, target, current=0, visited=None, path=None):
-        mat = np.triu(self.adj_matrix)
-        if visited is None:
-            visited = set()
-        if path is None:
-            path = []
-        visited.add(current)
-        if current == target:
-            return path
-        for neighbor in range(len(mat[current])):
-            if self.adj_matrix[current][neighbor] == 1 and neighbor not in visited:
-                path.append((current, neighbor))
-                result = self.find_path(target, neighbor, visited, path)
-                if result is not None:
-                    return result
-                path.pop()
-        return None
-
-    def create_grid_variable(self):
-        S = {}; V = {}; I = {}
-        s = {}; v = {}; i = {}
-        lam = {}; va = {}
-        connections = np.where(self.adj_matrix == 1)
-        for t in range(self.T):
-            for n in range(self.N):
-                s[f"{n}_{t}"] = cp.Variable((3, 1), complex=True)
-                V[f"{n}_{t}"] = cp.Variable((3, 1), complex=True)
-                v[f"{n}_{t}"] = cp.Variable((3, 3), complex=True)
-                va[f"{n}_{t}"] = cp.Variable(complex=False)
-                self.constraints += [v[f"{n}_{t}"] - va[f"{n}_{t}"]*self.B == 0]
-                self.constraints += [v[f"{n}_{t}"] >> 0]
-            for j, k in zip(*connections):
-                S[f"{j}{k}_{t}"] = cp.Variable((3, 3), complex=True)
-                I[f"{j}{k}_{t}"] = cp.Variable((3, 1), complex=True)
-                i[f"{j}{k}_{t}"] = cp.Variable((3, 3), complex=True)
-                lam[f"{j}{k}_{t}"] = cp.Variable((3, 1), complex=True)
-                self.constraints += [i[f"{j}{k}_{t}"] >> 0]
-        return (S, V, I, s, v, i, lam, va)
-
-    def create_device_variable(self):
-        p_battery = {}; p_PV = {}; p_impedance = {}
-        for t in range(self.T):
-            for n in self.battery_node_ls:
-                p_battery[f"{n}_{t}"] = cp.Variable((3, 1), complex=True)
-            for n in self.PV_node_ls:
-                p_PV[f"{n}_{t}"] = cp.Variable((3, 1), complex=True)
-            for n in self.impedance_node_ls:
-                p_impedance[f"{n}_{t}"] = cp.Variable((3, 1), complex=True)
-        return (p_battery, p_PV, p_impedance)
-
-    def solve(self):
-        self.lindistflow_constraints()
-        self.operational_constraints()
-        self.nodal_injection_equation()
-        # self.power_flow_equation()
-
-        '''
-        Need change: objective_func --> 1. mean value for bus power; 2. deployment cost
-        '''
-        objective_func = sum(self.RTP[t] * cp.real(self.grid_variable[3][f"0_{t}"][0]) for t in range(self.T))
-        objective = cp.Minimize(objective_func)
-        problem = cp.Problem(objective, self.constraints)
-        result = problem.solve()
-        print("Result: ", result)
-
-        return None
-
-
-    def lindistflow_constraints(self):
-        S, V, I, s, v, i, lam, va = self.grid_variable
-
-        # Total power constraint: Power in should equal power out
+        
+    def _add_linear_distribution_flow_constraints(self) -> None:
+        """Add linear distribution flow constraints."""
+        S, s, v, lam, va = self.grid_variables
+        
+        # Total power balance constraint
         for t in range(self.T):
             self.constraints += [sum(s[f"{n}_{t}"] for n in range(self.N)) == 0]
-
-        # Tree structure constraints: Power flows should be consistent through the tree
+            
+        # Tree structure constraints
         for t in range(self.T):
             connections = np.where(self.adj_matrix == 1)
             for j, k in zip(*connections):
-                sub_node = self.dfs(k)
-                subtree_power = sum(s[f"{n}_{t}"] for n in sub_node)
+                sub_nodes = self._dfs(k)
+                subtree_power = sum(s[f"{n}_{t}"] for n in sub_nodes)
                 self.constraints += [lam[f"{j}{k}_{t}"] + subtree_power == 0]
                 self.constraints += [S[f"{j}{k}_{t}"] - cp.matmul(self.gamma, cp.diag(lam[f"{j}{k}_{t}"])) == 0]
-
-        # Voltage - s constraints
+                
+        # Voltage-power constraints
         for t in range(self.T):
             for j, k in zip(*connections):
-                if j>k: # for Y_common
-                    voltage_diff = self.Y[f"{j}{k}"] @ (v[f"{j}_{t}"]-v[f"{k}_{t}"]) @ cp.conj(self.Y[f"{j}{k}"]).T
-                    self.constraints += [voltage_diff - cp.conj(S[f"{j}{k}_{t}"]).T @ cp.conj(self.Y[f"{j}{k}"]).T - self.Y[f"{j}{k}"] @ S[f"{j}{k}_{t}"] == 0]  
-
-
-    def operational_constraints(self):
-        S, V, I, s, v, i, lam, va = self.grid_variable
-        connections = np.where(self.adj_matrix == 1)
-        '''
-        Need change: v, s constraints --> 1. Set rational value for boundaries
-        '''
-
-        # v, s constraints
+                if j > k:  # For Y_common
+                    voltage_diff = (self.Y[f"{j}{k}"] @ (v[f"{j}_{t}"] - v[f"{k}_{t}"]) @ 
+                                  cp.conj(self.Y[f"{j}{k}"]).T)
+                    power_term = (cp.conj(S[f"{j}{k}_{t}"]).T @ cp.conj(self.Y[f"{j}{k}"]).T + 
+                                self.Y[f"{j}{k}"] @ S[f"{j}{k}_{t}"])
+                    self.constraints += [voltage_diff - power_term == 0]
+                    
+    def _add_operational_constraints(self) -> None:
+        """Add operational constraints (voltage and power limits)."""
+        S, s, v, lam, va = self.grid_variables
+        
+        # Voltage and power magnitude constraints
         for t in range(self.T):
             for n in range(self.N):
-                self.constraints += [cp.abs(cp.diag(v[f"{n}_{t}"])[i]) <= 300 for i in range(3)]
-                self.constraints += [cp.abs(s[f"{n}_{t}"][i]) <= 80 for i in range(3)]
-        # i constraints
-        for j, k in zip(*connections):
-            self.constraints += [cp.abs(i[f"{j}{k}_{t}"][p]) <= 100 for p in range(3)]
-
-    def nodal_injection_equation(self):
-        S, V, I, s, v, i, lam, va = self.grid_variable
-        p_battery, p_PV, p_impedance = self.device_variable
-
-        for t in range(self.T):
-            # Impedance power injection constraints
-            self.constraints += [p_impedance[f"0_{t}"] - (self.real_mainbus + self.imag_mainbus*1j)  - s[f"0_{t}"] == 0]
-            self.constraints += [p_impedance[f"1_{t}"] - (self.real_schlinger + self.imag_schlinger*1j)  - s[f"1_{t}"] == 0]
-            for n in self.impedance_node_ls:
-                self.constraints += [cp.abs(p_impedance[f"{n}_{t}"][p]) <= 100 for p in range(3)]
-                # self.constraints += [cp.real(p_impedance[f"{n}_0"]) <= 0]
-
-            # PV power injection constraints
-
-            # Battery power constraints
-            self.constraints += [p_battery[f"2_{t}"] - (self.real_resnick + self.imag_resnick*1j)  - s[f"2_{t}"] == 0]
-            self.constraints += [p_battery[f"3_{t}"] - (self.real_beckman + self.imag_beckman*1j)  - s[f"3_{t}"] == 0]
-            self.constraints += [p_battery[f"4_{t}"] - (self.real_braun + self.imag_braun*1j)  - s[f"4_{t}"] == 0]
-            for n in self.battery_node_ls:
-                # Battery state-of-charge constraints
-                self.constraints += [cp.abs(p_battery[f"{n}_{t}"][p]) <= 100 for p in range(3)]
-                # self.constraints += [p_battery[f"{n}_0"] == 0]
-
-
-    def power_flow_equation(self):
-        S, V, I, s, v, i, lam, va = self.grid_variable
-        connections = np.where(self.adj_matrix == 1)
+                self.constraints += [cp.abs(cp.diag(v[f"{n}_{t}"])[i]) <= BIG_M for i in range(PHASE_COUNT)]
+                self.constraints += [cp.abs(s[f"{n}_{t}"][i]) <= BIG_M for i in range(PHASE_COUNT)]
+                
+    def _add_nodal_injection_constraints(self) -> None:
+        """Add nodal power injection constraints."""
+        S, s, v, lam, va = self.grid_variables
+        p_battery, p_impedance = self.device_variables
         
         for t in range(self.T):
-            for j, k in zip(*connections):
-                self.constraints += [S[f"{j}{k}_{t}"] == cp.matmul(V[f"{j}_{t}"], cp.conj(I[f"{j}{k}_{t}"]).T)]
-            for n in range(self.N):
-                self.constraints += [v[f"{n}_{t}"] == cp.matmul(V[f"{n}_{t}"], cp.conj(V[f"{n}_{t}"]).T)]
+            # Impedance node constraints
+            self.constraints += [p_impedance[f"{NODE_INDICES['MAINBUS']}_{t}"] - 
+                               cp.reshape(self.real_mainbus[t], (3,1)) - cp.real(s[f"{NODE_INDICES['MAINBUS']}_{t}"]) == 0]
+            self.constraints += [p_impedance[f"{NODE_INDICES['BROAD']}_{t}"] - 
+                               cp.reshape(self.real_broad[t], (3,1)) - cp.real(s[f"{NODE_INDICES['BROAD']}_{t}"]) == 0]
+            self.constraints += [p_impedance[f"{NODE_INDICES['SCHLINGER']}_{t}"] - 
+                               cp.reshape(self.real_schlinger[t], (3,1)) - cp.real(s[f"{NODE_INDICES['SCHLINGER']}_{t}"]) == 0]
+            
+            for n in self.impedance_nodes:
+                self.constraints += [cp.abs(p_impedance[f"{n}_{t}"][p]) <= BIG_M for p in range(PHASE_COUNT)]
+                
+            # Battery node constraints
+            self.constraints += [p_battery[f"{NODE_INDICES['RESNICK']}_{t}"] - 
+                               cp.reshape(self.real_resnick[t], (3,1)) - cp.real(s[f"{NODE_INDICES['RESNICK']}_{t}"]) == 0]
+            self.constraints += [p_battery[f"{NODE_INDICES['BECKMAN']}_{t}"] - 
+                               cp.reshape(self.real_beckman[t], (3,1)) - cp.real(s[f"{NODE_INDICES['BECKMAN']}_{t}"]) == 0]
+            self.constraints += [p_battery[f"{NODE_INDICES['BRAUN']}_{t}"] - 
+                               cp.reshape(self.real_braun[t], (3,1)) - cp.real(s[f"{NODE_INDICES['BRAUN']}_{t}"]) == 0]
+            
+            for n in self.battery_nodes:
+                self.constraints += [cp.sum(p_battery[f"{n}_{t}"]) <= BIG_M]
+                self.constraints += [sum(cp.sum(p_battery[f"{n}_{t}"]) for t in range(self.T)) <= BIG_M]
+                
+    def _create_objective_function(self) -> cp.Expression:
+        """Create the objective function for optimization."""
+        S, s, v, lam, va = self.grid_variables
+        return sum(self.RTP * cp.real(s[f"{NODE_INDICES['MAINBUS']}_{t}"][0]) for t in range(self.T))
+        
+    def solve(self) -> Optional[float]:
+        """
+        Solve the optimal power flow problem.
+        
+        Returns:
+            Optimization result value or None if failed
+        """
+        self._add_linear_distribution_flow_constraints()
+        self._add_operational_constraints()
+        self._add_nodal_injection_constraints()
+        
+        objective = cp.Minimize(self._create_objective_function())
+        problem = cp.Problem(objective, self.constraints)
+        result = problem.solve()
+        
+        print(f"Optimization result: {result}")
+        return result
 
 
-class opf_problem_optnn(opf_problem):
+class OptimalPowerFlowNeuralNetwork(OptimalPowerFlowProblem):
+    """
+    Neural network-enabled OPF solver using CvxpyLayer.
+    
+    This class extends the basic OPF solver to integrate with PyTorch neural networks
+    for end-to-end training and optimization.
+    """
+    
     def __init__(self, T, N, Y_A, adj_matrix, node_class, RTP,
-                 real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-                 imag_mainbus, imag_schlinger, imag_resnick, imag_beckman, imag_braun):
+                 real_mainbus, real_broad, real_schlinger, real_resnick, real_beckman, real_braun):
+        """Initialize the neural network OPF solver."""
         super().__init__(T, N, Y_A, adj_matrix, node_class, RTP,
-                         real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-                         imag_mainbus, imag_schlinger, imag_resnick, imag_beckman, imag_braun)
-
-        self.lindistflow_constraints()
-        self.operational_constraints()
-        self.nodal_injection_equation()
-        # self.power_flow_equation()
-
-        objective_func = sum(self.RTP[t] * cp.real(self.grid_variable[3][f"0_{t}"][0]) for t in range(self.T))
-        objective = cp.Minimize(objective_func)
-        prob = cp.Problem(objective, self.constraints)
-        self.output = []
-        p_battery, p_PV, p_impedance, soc_battery = self.device_variable
-        for t in range(T):
-            for n in range(N):
-                if n in self.battery_node_ls:
-                    self.output.append(p_battery[f"{n}_{t}"])
-                    # Add SOC variables to output for monitoring
-                    self.output.append(soc_battery[f"{n}_{t}"])
-                if n in self.PV_node_ls:
-                    self.output.append(p_PV[f"{n}_{t}"])
-                if n in self.impedance_node_ls:
-                    self.output.append(p_impedance[f"{n}_{t}"])
-
-        assert prob.is_dpp()
-        self.prob = prob
-        self.layer = CvxpyLayer(prob, 
-                                parameters=[self.real_mainbus, self.real_schlinger, self.real_resnick, self.real_beckman, self.real_braun,
-                                            self.imag_mainbus, self.imag_schlinger, self.imag_resnick, self.imag_beckman, self.imag_braun], 
-                                variables=self.output)
-
-    def torch_loss(self,
-                   real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-                   imag_mainbus, imag_schlinger, imag_resnick, imag_beckman, imag_braun):
-        device_variable = self.forward(
-            real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-            imag_mainbus, imag_schlinger, imag_resnick, imag_beckman, imag_braun)
-        return self.compute_loss(real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-                                device_variable)
-    
-    def compute_loss(self,
-                     real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-                     device_variable):
-        p_battery = {}; p_PV = {}; p_impedance = {}
+                         real_mainbus, real_broad, real_schlinger, real_resnick, real_beckman, real_braun)
+        self._setup_neural_network()
+        
+    def _setup_neural_network(self) -> None:
+        """Setup the neural network components."""
+        self._add_linear_distribution_flow_constraints()
+        self._add_operational_constraints()
+        self._add_nodal_injection_constraints()
+        
+        # Create optimization problem
+        objective = cp.Minimize(self._create_objective_function())
+        self.problem = cp.Problem(objective, self.constraints)
+        
+        # Setup output variables for neural network
+        self.output_variables = self._create_output_variables()
+        
+        # Verify problem is DPP (Disciplined Parametric Programming)
+        assert self.problem.is_dpp(), "Problem must be DPP for CvxpyLayer"
+        
+        # Create CvxpyLayer
+        self.layer = CvxpyLayer(
+            self.problem,
+            parameters=[self.real_mainbus, 
+                       self.real_broad,
+                       self.real_schlinger,
+                       self.real_resnick,
+                       self.real_beckman,
+                       self.real_braun],
+            variables=self.output_variables
+        )
+        
+    def _create_output_variables(self) -> List[cp.Variable]:
+        """Create output variables for neural network."""
+        output = []
+        p_battery, p_impedance = self.device_variables
+        
         for t in range(self.T):
-            p_impedance[f"0_{t}"] = device_variable[t*5+0]
-            p_impedance[f"1_{t}"] = device_variable[t*5+1]
-            p_battery[f"2_{t}"] = device_variable[t*5+2]
-            p_battery[f"3_{t}"] = device_variable[t*5+3]
-            p_battery[f"4_{t}"] = device_variable[t*5+4]
+            for n in range(self.N):
+                if n in self.battery_nodes:
+                    output.append(p_battery[f"{n}_{t}"])
+                if n in self.impedance_nodes:
+                    output.append(p_impedance[f"{n}_{t}"])
+                    
+        return output
+        
+    def forward(self, 
+                real_mainbus: torch.Tensor,
+                real_broad: torch.Tensor,
+                real_schlinger: torch.Tensor,
+                real_resnick: torch.Tensor,
+                real_beckman: torch.Tensor,
+                real_braun: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the neural network.
+        
+        Args:
+            real_mainbus: Main bus real power demand
+            real_broad: Broad node real power demand
+            real_schlinger: Schlinger node real power demand
+            real_resnick: Resnick node real power demand
+            real_beckman: Beckman node real power demand
+            real_braun: Braun node real power demand
+            
+        Returns:
+            Neural network output
+        """
+        return self.layer(real_mainbus, real_broad, real_schlinger, real_resnick, 
+                         real_beckman, real_braun)
+        
+    def compute_loss(self,
+                     real_mainbus: torch.Tensor,
+                     real_broad: torch.Tensor,
+                     real_schlinger: torch.Tensor,
+                     real_resnick: torch.Tensor,
+                     real_beckman: torch.Tensor,
+                     real_braun: torch.Tensor,
+                     device_variable: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the loss function for training.
+        
+        Args:
+            real_mainbus: Main bus real power demand
+            real_broad: Broad node real power demand
+            real_schlinger: Schlinger node real power demand
+            real_resnick: Resnick node real power demand
+            real_beckman: Beckman node real power demand
+            real_braun: Braun node real power demand
+            device_variable: Device variables from forward pass
+            
+        Returns:
+            Computed loss value
+        """
+        p_battery, p_impedance = {}, {}
+        
+        # Parse device variables
+        for t in range(self.T):
+            p_impedance[f"{NODE_INDICES['MAINBUS']}_{t}"] = device_variable[t * 5 + 0]
+            p_impedance[f"{NODE_INDICES['BROAD']}_{t}"] = device_variable[t * 5 + 1]
+            p_impedance[f"{NODE_INDICES['SCHLINGER']}_{t}"] = device_variable[t * 5 + 2]
+            p_battery[f"{NODE_INDICES['RESNICK']}_{t}"] = device_variable[t * 5 + 2]
+            p_battery[f"{NODE_INDICES['BECKMAN']}_{t}"] = device_variable[t * 5 + 3]
+            p_battery[f"{NODE_INDICES['BRAUN']}_{t}"] = device_variable[t * 5 + 4]
+            
+        def compute_time_cost(t: int) -> torch.Tensor:
+            """Compute cost for time period t."""
+            # Impedance node costs
+            impedance_cost = (real_mainbus[t].unsqueeze(-1) - p_impedance[f"{NODE_INDICES['MAINBUS']}_{t}"].real +
+                            real_broad[t].unsqueeze(-1) - p_impedance[f"{NODE_INDICES['BROAD']}_{t}"].real +
+                            real_schlinger[t].unsqueeze(-1) - p_impedance[f"{NODE_INDICES['SCHLINGER']}_{t}"].real)
+            
+            # Battery node costs
+            battery_cost = (real_resnick[t].unsqueeze(-1) - p_battery[f"{NODE_INDICES['RESNICK']}_{t}"].real +
+                          real_beckman[t].unsqueeze(-1) - p_battery[f"{NODE_INDICES['BECKMAN']}_{t}"].real +
+                          real_braun[t].unsqueeze(-1) - p_battery[f"{NODE_INDICES['BRAUN']}_{t}"].real)
+            
+            return (impedance_cost + battery_cost)[0]
+            
+        return sum(self.RTP * compute_time_cost(t) for t in range(self.T))
+        
+    def torch_loss(self,
+                   real_mainbus: torch.Tensor,
+                   real_broad: torch.Tensor,
+                   real_schlinger: torch.Tensor,
+                   real_resnick: torch.Tensor,
+                   real_beckman: torch.Tensor,
+                   real_braun: torch.Tensor) -> torch.Tensor:
+        """
+        Compute PyTorch loss for training.
+        
+        Args:
+            real_mainbus: Main bus real power demand
+            real_broad: Broad node real power demand
+            real_schlinger: Schlinger node real power demand
+            real_resnick: Resnick node real power demand
+            real_beckman: Beckman node real power demand
+            real_braun: Braun node real power demand
+            
+        Returns:
+            PyTorch loss tensor
+        """
+        device_variable = self.forward(real_mainbus, real_broad, real_schlinger, real_resnick, 
+                                     real_beckman, real_braun)
+        return self.compute_loss(real_mainbus, real_broad, real_schlinger, real_resnick, 
+                               real_beckman, real_braun, device_variable)
 
-        def cost_t(t):
-            loss_t = 0
-            cost_impedance_node = 0
-            cost_battery_node = 0
-            cost_PV_node = 0
 
-            # phase a
-            cost_impedance_node = real_mainbus - p_impedance[f"0_{t}"].real
-            cost_impedance_node += real_schlinger - p_impedance[f"1_{t}"].real
-            cost_battery_node = real_resnick - p_battery[f"2_{t}"].real
-            cost_battery_node += real_beckman - p_battery[f"3_{t}"].real
-            cost_battery_node += real_braun - p_battery[f"4_{t}"].real
-
-            loss_t = cost_battery_node + cost_PV_node + cost_impedance_node
-            return loss_t[0]
-
-        cost = sum(self.RTP[t]*cost_t(t) for t in range(self.T))
-
-        return cost
-    
-    def forward(self,
-                real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-                imag_mainbus, imag_schlinger, imag_resnick, imag_beckman, imag_braun):
-        solution = self.layer(real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-                              imag_mainbus, imag_schlinger, imag_resnick, imag_beckman, imag_braun)
-        return solution
-
-def load_config(config_file):
+# Utility functions
+def load_config(config_file: str) -> dict:
+    """Load configuration from YAML file."""
     with open(config_file, 'r') as file:
-        config = yaml.safe_load(file)
-    return config
+        return yaml.safe_load(file)
 
-def str_to_matrices(arr):
-    return np.array([[complex(val.replace(' ', '')) for val in row] for row in arr], dtype=np.complex64)
+def str_to_matrices(arr: List[List[str]]) -> np.ndarray:
+    """Convert string array to complex matrices."""
+    return np.array([[complex(val.replace(' ', '')) for val in row] for row in arr], 
+                   dtype=np.complex64)
 
-def str_to_vector(arr):
-    return np.array([complex(val) for val in arr], dtype=np.complex64)
+def create_power_demands_from_config(config: dict) -> PowerDemands:
+    """Create PowerDemands object from configuration."""
+
+    # Load demand data
+    demands_mainbus = torch.tensor(list(map(float, config['demands_mainbus'][0].split()))) / 1000
+    demands_broad = torch.tensor(list(map(float, config['demands_broad'][0].split()))) / 1000
+    demands_schlinger = torch.tensor(list(map(float, config['demands_schlinger'][0].split()))) / 1000
+    demands_resnick = torch.tensor(list(map(float, config['demands_resnick'][0].split()))) / 1000
+    demands_beckman = torch.tensor(list(map(float, config['demands_beckman'][0].split()))) / 1000
+    demands_braun = torch.tensor(list(map(float, config['demands_braun'][0].split()))) / 1000
+    
+    return PowerDemands(
+        real_mainbus=demands_mainbus.unsqueeze(0),
+        real_broad=demands_broad.unsqueeze(0),
+        real_schlinger=demands_schlinger.unsqueeze(0),
+        real_resnick=demands_resnick.unsqueeze(0),
+        real_beckman=demands_beckman.unsqueeze(0),
+        real_braun=demands_braun.unsqueeze(0)
+    )
+
+
+def main():
+    """Main execution function."""
+    # Load configuration
+    config = load_config("config.yaml")
+    
+    # Create grid parameters
+    Y_A = {key: str_to_matrices(value) for key, value in config['Y_A'].items()}
+    grid_params = GridParameters(
+        T=config['T'],
+        N=len(config['adj_matrix']),
+        Y_A=Y_A,
+        adj_matrix=np.array(config['adj_matrix']),
+        node_class=config['node_class'],
+        RTP=float(0.118580418)
+    )
+    
+    # Create power demands
+    power_demands = create_power_demands_from_config(config)
+    
+    # Create and solve OPF problem
+    opf = OptimalPowerFlowNeuralNetwork(
+        grid_params.T, grid_params.N, grid_params.Y_A, grid_params.adj_matrix, 
+        grid_params.node_class, grid_params.RTP,
+        power_demands.real_mainbus, power_demands.real_broad, power_demands.real_schlinger, 
+        power_demands.real_resnick, power_demands.real_beckman, power_demands.real_braun
+    )
+    
+    # Compute loss
+    torch_loss = opf.torch_loss(
+        power_demands.real_mainbus,
+        power_demands.real_broad,
+        power_demands.real_schlinger,
+        power_demands.real_resnick,
+        power_demands.real_beckman,
+        power_demands.real_braun
+    )
+    
+    print(f"PyTorch loss: {torch_loss}")
+
 
 if __name__ == "__main__":
-    config = load_config("config.yaml")
-
-    # 读取配置中的Y_A并转换为复数矩阵
-    Y_A = {}
-    for key, value in config['Y_A'].items():
-        Y_A[key] = str_to_matrices(value)  # 使用str_to_complex函数解析复数字符串
-
-    RTP = np.array([config['RTP']])
-    T = config['T']
-    adj_matrix = np.array(config['adj_matrix'])
-    N = len(adj_matrix)
-
-    node_class = config['node_class']
-
-    # 读取并转换需求数据
-    demands_mainbus = torch.tensor(str_to_vector(config['demands_mainbus']), dtype=torch.complex64)/1000
-    demands_schlinger = torch.tensor(str_to_vector(config['demands_schlinger']), dtype=torch.complex64)/1000
-    demands_resnick = torch.tensor(str_to_vector(config['demands_resnick']), dtype=torch.complex64)/1000
-    demands_beckman = torch.tensor(str_to_vector(config['demands_beckman']), dtype=torch.complex64)/1000
-    demands_braun = torch.tensor(str_to_vector(config['demands_braun']), dtype=torch.complex64)/1000
-
-    def split_real_imag(tensor):
-        real_part = (tensor.real).unsqueeze(-1)
-        imag_part = (tensor.imag).unsqueeze(-1)
-        return real_part, imag_part
-
-    real_mainbus, imag_mainbus = split_real_imag(demands_mainbus)
-    real_schlinger, imag_schlinger = split_real_imag(demands_schlinger)
-    real_resnick, imag_resnick = split_real_imag(demands_resnick)
-    real_beckman, imag_beckman = split_real_imag(demands_beckman)
-    real_braun, imag_braun = split_real_imag(demands_braun)
-
-    opf = opf_problem_optnn(T, N, Y_A, adj_matrix, node_class, RTP, 
-                            real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-                            imag_mainbus, imag_schlinger, imag_resnick, imag_beckman, imag_braun)
-
-    torch_loss = opf.torch_loss(real_mainbus, real_schlinger, real_resnick, real_beckman, real_braun,
-                                imag_mainbus, imag_schlinger, imag_resnick, imag_beckman, imag_braun)
-    print(torch_loss)
+    main()

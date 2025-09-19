@@ -23,6 +23,7 @@ class ParallelLSTMs(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=1):
         super(ParallelLSTMs, self).__init__()
         self.lstm_mainbus = LSTMNet(input_dim, hidden_dim, output_dim)
+        self.lstm_broad = LSTMNet(input_dim, hidden_dim, output_dim)
         self.lstm_schlinger = LSTMNet(input_dim, hidden_dim, output_dim)
         self.lstm_resnick = LSTMNet(input_dim, hidden_dim, output_dim)
         self.lstm_beckman = LSTMNet(input_dim, hidden_dim, output_dim)
@@ -30,12 +31,13 @@ class ParallelLSTMs(nn.Module):
     
     def forward(self, x):
         mainbus_mu, mainbus_sigma = self.lstm_mainbus(x)
+        broad_mu, broad_sigma = self.lstm_broad(x)
         schlinger_mu, schlinger_sigma = self.lstm_schlinger(x)
         resnick_mu, resnick_sigma = self.lstm_resnick(x)
         beckman_mu, beckman_sigma = self.lstm_beckman(x)
         braun_mu, braun_sigma = self.lstm_braun(x)
 
-        mu = torch.cat([mainbus_mu, schlinger_mu, resnick_mu, beckman_mu, braun_mu], dim=1)
-        sigma = torch.cat([mainbus_sigma, schlinger_sigma, resnick_sigma, beckman_sigma, braun_sigma], dim=1)
+        mu = torch.cat([mainbus_mu, broad_mu, schlinger_mu, resnick_mu, beckman_mu, braun_mu], dim=1)
+        sigma = torch.cat([mainbus_sigma, broad_sigma, schlinger_sigma, resnick_sigma, beckman_sigma, braun_sigma], dim=1)
 
         return mu, sigma
